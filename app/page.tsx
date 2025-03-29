@@ -1,103 +1,318 @@
-import Image from "next/image";
+'use client'
 
-export default function Home() {
+import React, { useEffect } from 'react';
+import { v4 as uuidv4 } from 'uuid';
+import UploadArea from '@/components/UploadArea';
+import DocumentViewer from '@/components/DocumentViewer';
+import AnnotationTools from '@/components/AnnotationTools';
+import SignatureModal from '@/components/SignatureModal';
+import CommentModal from '@/components/CommentModal';
+import { Annotation, AnnotationTool } from '@/lib/annotations';
+import { fileToArrayBuffer, applyAnnotationsToPDF, downloadPDF } from '@/lib/pdfUtils';
+import { useToast } from '@/components/ui/use-toast';
+import { useDocumentContext } from '@/context/DocumentContext';
+
+const Home = () => {
+  const [commentToEdit, setCommentToEdit] = React.useState<Annotation | null>(null);
+  const {
+    file,
+    selectedTool,
+    selectedColor,
+    annotations,
+    isSignatureModalOpen,
+    isCommentModalOpen,
+    tempPosition,
+    setFile,
+    setSelectedTool,
+    setSelectedColor,
+    setAnnotations,
+    setIsSignatureModalOpen,
+    setIsCommentModalOpen,
+    setTempPosition,
+    removeLastAnnotation,
+    saveToLocalStorage,
+    loadFromLocalStorage
+  } = useDocumentContext();
+  
+  const { toast } = useToast();
+
+  // Check for saved data on initial load
+  useEffect(() => {
+    const hasSavedData = loadFromLocalStorage();
+    if (hasSavedData && annotations.length > 0) {
+      toast({
+        title: "Restored session",
+        description: "Your previous work has been restored",
+      });
+    }
+  }, []);
+
+  const handleFileUpload = (uploadedFile: File) => {
+    setFile(uploadedFile);
+    // Keep existing annotations if the document looks the same,
+    // otherwise clear them (optional - could prompt user instead)
+    toast({
+      title: "Document uploaded",
+      description: `Successfully loaded ${uploadedFile.name}`,
+    });
+  };
+
+  const handleToolChange = (tool: AnnotationTool) => {
+    if (tool === selectedTool) {
+      setSelectedTool('none');
+    } else {
+      setSelectedTool(tool);
+    }
+  };
+
+  const handleColorChange = (color: string) => {
+    setSelectedColor(color);
+  };
+
+  const handleAnnotationCreate = (annotation: Omit<Annotation, 'id'>) => {
+    if (annotation.type === 'comment') {
+      const existingComment = annotations.find(
+        a => 
+          a.type === 'comment' && 
+          a.pageNumber === annotation.pageNumber &&
+          Math.abs(a.x - annotation.x) < 10 && // Add some tolerance
+          Math.abs(a.y - annotation.y) < 10
+      );
+  
+      setTempPosition({
+        x: annotation.x,
+        y: annotation.y,
+        pageNumber: annotation.pageNumber
+      });
+      
+      // If we found an existing comment, we'll edit it instead of creating a new one
+      if (existingComment) {
+        // Pass the existing comment content as initialComment
+        setCommentToEdit(existingComment);
+        setIsCommentModalOpen(true);
+      } else {
+        // No existing comment, create a new one
+        setCommentToEdit(null);
+        setIsCommentModalOpen(true);
+      }
+    } else if (annotation.type === 'signature') {
+      setTempPosition({
+        x: annotation.x,
+        y: annotation.y,
+        pageNumber: annotation.pageNumber
+      });
+      setIsSignatureModalOpen(true);
+    } else {
+      const newAnnotation: Annotation = {
+        ...annotation,
+        id: uuidv4()
+      };
+      setAnnotations(prev => [...prev, newAnnotation]);
+    }
+  };
+
+  const handleSignatureSave = (signatureDataUrl: string) => {
+    if (tempPosition) {
+      const newAnnotation: Annotation = {
+        id: uuidv4(),
+        type: 'signature',
+        x: tempPosition.x,
+        y: tempPosition.y,
+        content: signatureDataUrl,
+        pageNumber: tempPosition.pageNumber
+      };
+      setAnnotations(prev => [...prev, newAnnotation]);
+      setIsSignatureModalOpen(false);
+      setTempPosition(null);
+    }
+  };
+
+  const handleCommentSave = (commentText: string) => {
+    if (tempPosition) {
+      if (commentToEdit) {
+        // Update existing comment
+        setAnnotations(prev => 
+          prev.map(a => 
+            a.id === commentToEdit.id 
+              ? { ...a, content: commentText } 
+              : a
+          )
+        );
+      } else {
+        // Create new comment
+        const newAnnotation: Annotation = {
+          id: uuidv4(),
+          type: 'comment',
+          x: tempPosition.x,
+          y: tempPosition.y,
+          content: commentText,
+          pageNumber: tempPosition.pageNumber
+        };
+        setAnnotations(prev => [...prev, newAnnotation]);
+      }
+      setIsCommentModalOpen(false);
+      setTempPosition(null);
+      setCommentToEdit(null);
+    }
+  };
+
+  const handleUndo = () => {
+    removeLastAnnotation();
+    toast({
+      title: "Action undone",
+      description: "The last annotation has been removed",
+    });
+  };
+
+  // In your Home.tsx file, modify the handleExport function:
+
+  const handleExport = async () => {
+    if (!file) return;
+    
+    try {
+      toast({
+        title: "Processing",
+        description: "Preparing your annotated document...",
+      });
+      
+      // Debug annotations before export to help troubleshoot
+      console.log('Exporting with annotations:', annotations);
+      
+      const pdfBytes = await fileToArrayBuffer(file);
+      
+      // Get a reference to your PDF viewer container to potentially calculate scaling
+      const pdfViewerContainer = document.getElementById('pdf-viewer-container');
+      if (pdfViewerContainer) {
+        console.log('Viewer dimensions:', {
+          width: pdfViewerContainer.clientWidth,
+          height: pdfViewerContainer.clientHeight
+        });
+      }
+      
+      // Use page offset to fix the page numbering issue
+      // The default value of -1 assumes UI uses 0-based indexing but there's an off-by-one error
+      // You may need to adjust this value to 0, -1, or 1 based on testing
+      const pageOffset = -1;
+      
+      const pdfDoc = await applyAnnotationsToPDF(pdfBytes, annotations, pageOffset);
+      await downloadPDF(pdfDoc, `annotated-${file.name}`);
+      
+      toast({
+        title: "Export Complete",
+        description: "Your annotated document has been downloaded",
+      });
+    } catch (error) {
+      console.error("Export error:", error);
+      toast({
+        title: "Export Failed",
+        description: "There was an error exporting your document",
+        variant: "destructive",
+      });
+    }
+  };
+     
+  const handleSaveSession = () => {
+    if (saveToLocalStorage()) {
+      toast({
+        title: "Session saved",
+        description: "Your work has been saved in this browser",
+      });
+    } else {
+      toast({
+        title: "Failed to save",
+        description: "There was an error saving your session",
+        variant: "destructive",
+      });
+    }
+  };
+
+  const handleClearSession = () => {
+    if (window.confirm("Are you sure you want to clear your work? This cannot be undone.")) {
+      setAnnotations([]);
+      localStorage.removeItem('documentSigner_annotations');
+      localStorage.removeItem('documentSigner_fileMetadata');
+      localStorage.removeItem('documentSigner_selectedColor');
+      toast({
+        title: "Session cleared",
+        description: "All saved work has been cleared",
+      });
+    }
+  };
+
   return (
-    <div className="grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20 font-[family-name:var(--font-geist-sans)]">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="list-inside list-decimal text-sm/6 text-center sm:text-left font-[family-name:var(--font-geist-mono)]">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] px-1 py-0.5 rounded font-[family-name:var(--font-geist-mono)] font-semibold">
-              app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
-
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
+    <div className="flex flex-col min-h-screen bg-gray-50">
+      <header className="bg-white shadow-sm py-4 px-6 flex justify-between items-center">
+        <h1 className="text-2xl font-bold text-gray-800">Document Signer- PDF Annotation Tool</h1>
+        {annotations.length > 0 && (
+          <button
+            onClick={handleClearSession}
+            className="text-red-500 hover:text-red-700 text-sm"
           >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
+            Clear Session
+          </button>
+        )}
+      </header>
+      
+      <main className="flex-1 flex flex-col lg:flex-row p-4 gap-4">
+        {!file ? (
+          <div className="w-full max-w-2xl mx-auto">
+            <UploadArea onFileUpload={handleFileUpload} />
+            {annotations.length > 0 && (
+              <div className="mt-4 p-4 bg-yellow-100 rounded-lg">
+                <p className="text-yellow-800">You have unsaved annotations from a previous session.</p>
+                <p className="text-yellow-800">Please upload the same document to continue your work.</p>
+              </div>
+            )}
+          </div>
+        ) : (
+          <>
+            <aside className="w-full lg:w-64 flex-shrink-0">
+            <AnnotationTools
+              selectedTool={selectedTool}
+              selectedColor={selectedColor}
+              onToolChange={handleToolChange}
+              onColorChange={handleColorChange}
+              onExport={handleExport}
+              onUndo={handleUndo}
+              canUndo={annotations.length > 0}
+              onSaveSession={handleSaveSession}
             />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
-        </div>
+            </aside>
+            
+            <div className="flex-1 overflow-hidden">
+              <DocumentViewer
+                file={file}
+                activeTool={selectedTool}
+                selectedColor={selectedColor}
+                annotations={annotations}
+                onAnnotationCreate={handleAnnotationCreate}
+              />
+            </div>
+          </>
+        )}
       </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+      
+      <SignatureModal
+        isOpen={isSignatureModalOpen}
+        onClose={() => {
+          setIsSignatureModalOpen(false);
+          setTempPosition(null);
+        }}
+        onSave={handleSignatureSave}
+      />
+      
+      <CommentModal
+        isOpen={isCommentModalOpen}
+        onClose={() => {
+          setIsCommentModalOpen(false);
+          setTempPosition(null);
+          setCommentToEdit(null);
+        }}
+        onSave={handleCommentSave}
+        initialComment={commentToEdit ? commentToEdit.content : ''}
+      />
     </div>
   );
-}
+};
+
+export default Home;
