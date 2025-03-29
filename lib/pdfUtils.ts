@@ -52,20 +52,17 @@ const hexToRgb = (hex: string) => {
 export const applyAnnotationsToPDF = async (
   pdfBytes: ArrayBuffer, 
   annotations: Annotation[],
-  pageOffset: number = -1 // Default: Assumes 0-based in UI, 0-based in PDF-lib, but fixing off-by-one issue
+  pageOffset: number = 0 // Default: Assumes 0-based in UI, 0-based in PDF-lib, but fixing off-by-one issue
 ): Promise<PDFDocument> => {
   // Load the PDF document
   const pdfDoc = await PDFDocument.load(pdfBytes);
   const pages = pdfDoc.getPages();
   
   console.log('PDF document has', pages.length, 'pages');
+
   
   // Get a standard font
   const helveticaFont = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  
-  // Process PDF metadata to potentially find scaling factors
-  // No direct way to get scale factor, so we'll use a best-guess approach
-  const scale = 1; // Default scale factor
   
   // Enhanced debugging for page numbers
   const allPageNumbers = annotations.map(a => a.pageNumber);
@@ -76,7 +73,9 @@ export const applyAnnotationsToPDF = async (
   const annotationsByPage: Record<number, Annotation[]> = {};
   annotations.forEach(annotation => {
     // Apply page offset when grouping annotations
-    const adjustedPageNum = annotation.pageNumber + pageOffset;
+    // const adjustedPageNum = annotation.pageNumber + pageOffset;
+    const adjustedPageNum = Math.max(0, Math.min(annotation.pageNumber, pages.length - 1));
+
     if (!annotationsByPage[adjustedPageNum]) {
       annotationsByPage[adjustedPageNum] = [];
     }
@@ -105,23 +104,53 @@ export const applyAnnotationsToPDF = async (
       const origX = annotation.x;
       const origY = annotation.y;
       
-      // Transform annotation coordinates from the viewer space to PDF space
-      // Most common issue is that the PDF viewer scales the PDF to fit the viewport
-      // and has a different coordinate origin than PDF-lib
-      const pdfX = origX * scale;
-      const pdfY = height - (origY * scale); // Flip Y-coordinate for PDF coordinate system
+      // Calculate the scale factor between PDF dimensions and viewer dimensions
+      let scaleFactor = 1;
+      if (annotation.metadata) {
+        const { originalScale, pageWidth, pageHeight } = annotation.metadata;
+        // Calculate scale factor based on the ratio between PDF dimensions and viewer dimensions
+        const viewerWidth = pageWidth;
+        // const viewerWidth = pageWidth / originalScale;
+        const viewerHeight = pageHeight;
+        // const viewerHeight = pageHeight / originalScale;
+        
+        const xScale = width / viewerWidth;
+        const yScale = height / viewerHeight;
+        
+        // Use the average scale to handle any slight differences
+        // scaleFactor = (xScale + yScale) / 2;
+        scaleFactor = Math.min(xScale, yScale);
+        console.log(`Scale factor calculated: ${scaleFactor} (PDF: ${width}x${height}, Viewer: ${viewerWidth}x${viewerHeight})`);
+      }
       
-      console.log(`Annotation: ${annotation.type} at Original(${origX}, ${origY}), PDF(${pdfX}, ${pdfY}), Page: ${pageIndex}`);
+      // Transform annotation coordinates from the viewer space to PDF space
+      const pdfX = origX * scaleFactor;
+      
+      // Flip Y-coordinate for PDF coordinate system
+      // PDF coordinates start from bottom-left, while browser coordinates start from top-left
+      // const pdfY = height - (origY * scaleFactor);
+      // const pdfY = height - origY;
+      const pdfY = height - (origY * scaleFactor) - (annotation.height ? annotation.height * scaleFactor : 10);
+
+
+      
+      console.log(`Annotation: ${annotation.type} at Original(${origX}, ${origY}), PDF(${pdfX}, ${pdfY}), Page: ${pageIndex}, Scale: ${scaleFactor}`);
+      console.log(`Annotation (${annotation.type}) on UI: x=${annotation.x}, y=${annotation.y}`);
+      console.log(`Transformed to PDF: x=${pdfX}, y=${pdfY}`);
+      console.log(`PDF page size: width=${width}, height=${height}`);
+      console.log(`Scale Factor: ${scaleFactor}`);
+
       
       switch (annotation.type) {
         case 'highlight': {
           const color = hexToRgb(annotation.color || '#FFEB3B');
-          const highlightHeight = annotation.height || 20;
+          const highlightHeight = annotation.height ? annotation.height * scaleFactor : 20;
+          const highlightWidth = annotation.width ? annotation.width * scaleFactor : 100;
           
           page.drawRectangle({
             x: pdfX,
             y: pdfY - highlightHeight, // Adjust Y for the height of the highlight
-            width: annotation.width || 100,
+            width: highlightWidth,
             height: highlightHeight,
             color: rgb(color.r, color.g, color.b),
             opacity: 0.3,
@@ -131,10 +160,11 @@ export const applyAnnotationsToPDF = async (
         
         case 'underline': {
           const color = hexToRgb(annotation.color || '#FF0000');
+          const underlineWidth = annotation.width ? annotation.width * scaleFactor : 100;
           
           page.drawLine({
             start: { x: pdfX, y: pdfY },
-            end: { x: pdfX + (annotation.width || 100), y: pdfY },
+            end: { x: pdfX + underlineWidth, y: pdfY },
             thickness: 2,
             color: rgb(color.r, color.g, color.b),
           });
@@ -142,7 +172,7 @@ export const applyAnnotationsToPDF = async (
         }
         
         case 'comment': {
-          const iconSize = 20;
+          const iconSize = 20 * scaleFactor;
           
           // Draw comment icon
           page.drawRectangle({
@@ -158,7 +188,7 @@ export const applyAnnotationsToPDF = async (
           
           // Draw comment text
           const commentText = annotation.content || '';
-          const textSize = 10;
+          const textSize = 10 * scaleFactor;
           const textWidth = helveticaFont.widthOfTextAtSize(commentText, textSize);
           
           // Position text to the right of the icon
@@ -235,15 +265,19 @@ export const applyAnnotationsToPDF = async (
               signatureImage = await pdfDoc.embedJpg(imageBytes);
             }
             
-            const dims = signatureImage.scale(1);
-            console.log('Signature dimensions:', dims);
+            // Scale the signature appropriately
+            const originalDims = signatureImage.scale(1);
+            const scaledWidth = originalDims.width * scaleFactor;
+            const scaledHeight = originalDims.height * scaleFactor;
+            
+            console.log('Signature dimensions:', originalDims, 'Scaled:', scaledWidth, scaledHeight);
             
             // Draw the signature on the page
             page.drawImage(signatureImage, {
               x: pdfX,
-              y: pdfY - dims.height, // Position from bottom of signature
-              width: dims.width,
-              height: dims.height,
+              y: pdfY - scaledHeight, // Position from bottom of signature
+              width: scaledWidth,
+              height: scaledHeight,
             });
             
             console.log('Signature drawn successfully');
@@ -273,6 +307,10 @@ export const debugAnnotations = (annotations: Annotation[]): void => {
     console.log(`  Position: (${ann.x}, ${ann.y})`);
     console.log(`  Page: ${ann.pageNumber}`);
     
+    if (ann.metadata) {
+      console.log(`  Metadata: originalScale=${ann.metadata.originalScale}, pageWidth=${ann.metadata.pageWidth}, pageHeight=${ann.metadata.pageHeight}`);
+    }
+    
     if (ann.type === 'signature') {
       console.log(`  Signature content length: ${ann.content?.length || 0}`);
       console.log(`  Signature content starts with: ${ann.content?.substring(0, 30)}...`);
@@ -280,6 +318,11 @@ export const debugAnnotations = (annotations: Annotation[]): void => {
     
     if (ann.type === 'comment') {
       console.log(`  Comment text: ${ann.content}`);
+    }
+    
+    if (ann.type === 'highlight' || ann.type === 'underline') {
+      console.log(`  Width: ${ann.width}, Height: ${ann.height}`);
+      console.log(`  Selected text: ${ann.content}`);
     }
     
     if (ann.color) {
